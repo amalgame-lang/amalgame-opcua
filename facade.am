@@ -1,0 +1,485 @@
+// amalgame-opcua — OPC UA for Amalgame, over open62541 (vendored, MPL-2.0).
+//
+// Client : connect, read many nodes in one request, and BrowseTree,
+// which walks the address space and returns every variable with its
+// path, data type, value, engineering unit and EURange. That is what
+// lets an application bind a PLC's variables without a tag list.
+// Server : a small OPC UA server for tests and demos (folders, analog
+// items with unit and range, values written from the application).
+//
+//   let h: int = OpcUa.Connect("opc.tcp://192.168.1.20:4840", 2000)
+//   let n: int = OpcUa.ReadMany(h, "ns=1;s=P1.Debit,ns=1;s=P1.Etat")
+//   let debit: float = OpcUa.Value(h, 0)            // Status(h, 0) == 0 : good
+//   let tree: string = OpcUa.BrowseTree(h, "i=85", 6, 2000)   // JSON
+//
+// v0.1 : security mode None (anonymous). The library is built with
+// OpenSSL encryption ; certificates come in v0.2.
+
+namespace Amalgame.OpcUa
+
+@c {
+    /* The open62541 amalgamation, unchanged but for its encryption
+     * backend (OpenSSL instead of mbedTLS, see NOTICE.md). */
+    #include "open62541.h"
+    #include "open62541.c"
+    #include <pthread.h>
+    #include <math.h>
+
+    #define OPCUA_HANDLES 32
+    #define OPCUA_VALUES  1024
+
+    typedef struct {
+        int      used;
+        UA_Client* client;
+        char     url[256];
+        char     err[256];
+        int      n;
+        double   vals[OPCUA_VALUES];
+        uint32_t status[OPCUA_VALUES];
+        pthread_mutex_t mu;
+    } opcua_handle_t;
+
+    static opcua_handle_t _opcua_h[OPCUA_HANDLES];
+    static pthread_mutex_t _opcua_mu = PTHREAD_MUTEX_INITIALIZER;
+
+    static opcua_handle_t* _opcua_get(int64_t h) {
+        if (h < 0 || h >= OPCUA_HANDLES || !_opcua_h[h].used) return 0;
+        return &_opcua_h[h];
+    }
+
+    static void _opcua_err(opcua_handle_t* x, const char* what, UA_StatusCode sc) {
+        snprintf(x->err, sizeof(x->err), "%s : %s", what, UA_StatusCode_name(sc));
+    }
+
+    /* Connected, or connect again (a handle survives a server restart). */
+    static int _opcua_ensure(opcua_handle_t* x) {
+        UA_SecureChannelState scs; UA_SessionState ss; UA_StatusCode cs;
+        UA_Client_getState(x->client, &scs, &ss, &cs);
+        if (ss == UA_SESSIONSTATE_ACTIVATED) return 1;
+        UA_StatusCode sc = UA_Client_connect(x->client, x->url);
+        if (sc != UA_STATUSCODE_GOOD) { _opcua_err(x, "connect", sc); return 0; }
+        return 1;
+    }
+
+    static int64_t _opcua_connect(const char* url, int64_t timeout_ms) {
+        if (!url || strncmp(url, "opc.tcp://", 10) != 0 || strlen(url) >= 256) return -1;
+        pthread_mutex_lock(&_opcua_mu);
+        int h = -1;
+        for (int i = 0; i < OPCUA_HANDLES; i++) if (!_opcua_h[i].used) { h = i; break; }
+        if (h < 0) { pthread_mutex_unlock(&_opcua_mu); return -1; }
+        opcua_handle_t* x = &_opcua_h[h];
+        memset(x, 0, sizeof(*x));
+        x->used = 1;
+        pthread_mutex_init(&x->mu, 0);
+        strcpy(x->url, url);
+        x->client = UA_Client_new();
+        UA_ClientConfig* cc = UA_Client_getConfig(x->client);
+        UA_ClientConfig_setDefault(cc);
+        cc->timeout = (UA_UInt32) (timeout_ms > 0 ? timeout_ms : 2000);
+        /* open62541 logs every step at info level : warnings and errors only. */
+        cc->logging = UA_Log_Stdout_new(UA_LOGLEVEL_WARNING);
+        pthread_mutex_unlock(&_opcua_mu);
+        /* A server that does not answer yet still gets a handle : every
+         * call tries to connect again, as amalgame-modbus does. */
+        pthread_mutex_lock(&x->mu);
+        _opcua_ensure(x);
+        pthread_mutex_unlock(&x->mu);
+        return h;
+    }
+
+    static double _opcua_number(const UA_Variant* v, int* ok) {
+        *ok = 1;
+        if (!UA_Variant_isScalar(v) || !v->data) { *ok = 0; return NAN; }
+        const UA_DataType* t = v->type;
+        if (t == &UA_TYPES[UA_TYPES_DOUBLE])  return *(UA_Double*) v->data;
+        if (t == &UA_TYPES[UA_TYPES_FLOAT])   return *(UA_Float*) v->data;
+        if (t == &UA_TYPES[UA_TYPES_INT16])   return *(UA_Int16*) v->data;
+        if (t == &UA_TYPES[UA_TYPES_UINT16])  return *(UA_UInt16*) v->data;
+        if (t == &UA_TYPES[UA_TYPES_INT32])   return *(UA_Int32*) v->data;
+        if (t == &UA_TYPES[UA_TYPES_UINT32])  return *(UA_UInt32*) v->data;
+        if (t == &UA_TYPES[UA_TYPES_INT64])   return (double) *(UA_Int64*) v->data;
+        if (t == &UA_TYPES[UA_TYPES_UINT64])  return (double) *(UA_UInt64*) v->data;
+        if (t == &UA_TYPES[UA_TYPES_BYTE])    return *(UA_Byte*) v->data;
+        if (t == &UA_TYPES[UA_TYPES_SBYTE])   return *(UA_SByte*) v->data;
+        if (t == &UA_TYPES[UA_TYPES_BOOLEAN]) return *(UA_Boolean*) v->data ? 1 : 0;
+        *ok = 0; return NAN;
+    }
+
+    /* Read the Value attribute of comma-separated node ids, in one request.
+     * Returns how many came back good ; -1 on a connection error. */
+    static int64_t _opcua_read_many(int64_t h, const char* csv) {
+        opcua_handle_t* x = _opcua_get(h);
+        if (!x || !csv) return -4;
+        pthread_mutex_lock(&x->mu);
+        if (!_opcua_ensure(x)) { pthread_mutex_unlock(&x->mu); return -1; }
+        UA_ReadValueId ids[OPCUA_VALUES];
+        int n = 0;
+        const char* p = csv;
+        while (*p && n < OPCUA_VALUES) {
+            const char* e = strchr(p, ',');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            UA_ReadValueId_init(&ids[n]);
+            ids[n].attributeId = UA_ATTRIBUTEID_VALUE;
+            UA_String s = {len, (UA_Byte*) p};
+            if (UA_NodeId_parse(&ids[n].nodeId, s) != UA_STATUSCODE_GOOD) ids[n].nodeId = UA_NODEID_NULL;
+            n++;
+            if (!e) break;
+            p = e + 1;
+        }
+        UA_ReadRequest req; UA_ReadRequest_init(&req);
+        req.nodesToRead = ids; req.nodesToReadSize = (size_t) n;
+        req.timestampsToReturn = UA_TIMESTAMPSTORETURN_NEITHER;
+        UA_ReadResponse res = UA_Client_Service_read(x->client, req);
+        int good = 0;
+        if (res.responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
+            _opcua_err(x, "read", res.responseHeader.serviceResult);
+            good = -1;
+        } else {
+            x->n = n;
+            for (int i = 0; i < n; i++) {
+                x->vals[i] = NAN; x->status[i] = UA_STATUSCODE_BADNOTREADABLE;
+                if (i >= (int) res.resultsSize) continue;
+                UA_DataValue* dv = &res.results[i];
+                UA_StatusCode sc = dv->hasStatus ? dv->status : UA_STATUSCODE_GOOD;
+                int ok = 0;
+                double v = dv->hasValue ? _opcua_number(&dv->value, &ok) : NAN;
+                if (sc == UA_STATUSCODE_GOOD && !ok) sc = UA_STATUSCODE_BADTYPEMISMATCH;
+                x->vals[i] = v; x->status[i] = sc;
+                if (sc == UA_STATUSCODE_GOOD) good++;
+            }
+        }
+        for (int i = 0; i < n; i++) UA_NodeId_clear(&ids[i].nodeId);
+        UA_ReadResponse_clear(&res);
+        pthread_mutex_unlock(&x->mu);
+        return good;
+    }
+
+    /* ---------- BrowseTree : the address space, as JSON ---------- */
+    typedef struct { char* buf; size_t len, cap; } opcua_sb_t;
+    static void _sb_add(opcua_sb_t* b, const char* s, size_t n) {
+        if (b->len + n + 1 > b->cap) {
+            size_t c = b->cap ? b->cap * 2 : 4096;
+            while (c < b->len + n + 1) c *= 2;
+            b->buf = (char*) realloc(b->buf, c); b->cap = c;
+        }
+        memcpy(b->buf + b->len, s, n); b->len += n; b->buf[b->len] = 0;
+    }
+    static void _sb_str(opcua_sb_t* b, const char* s, size_t n) {   /* JSON string */
+        _sb_add(b, "\"", 1);
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char) s[i]; char e[8];
+            if (c == '"' || c == '\\') { e[0] = '\\'; e[1] = (char) c; _sb_add(b, e, 2); }
+            else if (c < 0x20) { snprintf(e, sizeof(e), "\\u%04x", c); _sb_add(b, e, 6); }
+            else _sb_add(b, (const char*) &s[i], 1);
+        }
+        _sb_add(b, "\"", 1);
+    }
+    static void _sb_nodeid(opcua_sb_t* b, const UA_NodeId* id) {
+        UA_String s = UA_STRING_NULL; UA_NodeId_print(id, &s);
+        _sb_str(b, (const char*) s.data, s.length); UA_String_clear(&s);
+    }
+
+    typedef struct { UA_NodeId id; char path[512]; int depth; } opcua_item_t;
+
+    /* Properties of a variable we care about : EngineeringUnits, EURange. */
+    static void _opcua_props(UA_Client* c, const UA_NodeId* var, opcua_sb_t* b) {
+        UA_BrowseDescription bd; UA_BrowseDescription_init(&bd);
+        bd.nodeId = *var; bd.browseDirection = UA_BROWSEDIRECTION_FORWARD;
+        bd.referenceTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY);
+        bd.includeSubtypes = true; bd.resultMask = UA_BROWSERESULTMASK_BROWSENAME;
+        UA_BrowseRequest br; UA_BrowseRequest_init(&br);
+        br.nodesToBrowse = &bd; br.nodesToBrowseSize = 1;
+        UA_BrowseResponse r = UA_Client_Service_browse(c, br);
+        for (size_t i = 0; i < r.resultsSize; i++) for (size_t j = 0; j < r.results[i].referencesSize; j++) {
+            UA_ReferenceDescription* rd = &r.results[i].references[j];
+            int isRange = UA_String_equal(&rd->browseName.name, &(UA_String){7, (UA_Byte*) "EURange"});
+            int isUnit = UA_String_equal(&rd->browseName.name, &(UA_String){16, (UA_Byte*) "EngineeringUnits"});
+            if (!isRange && !isUnit) continue;
+            UA_Variant v; UA_Variant_init(&v);
+            if (UA_Client_readValueAttribute(c, rd->nodeId.nodeId, &v) == UA_STATUSCODE_GOOD && v.data) {
+                if (isRange && v.type == &UA_TYPES[UA_TYPES_RANGE]) {
+                    UA_Range* rg = (UA_Range*) v.data; char t[96];
+                    int k = snprintf(t, sizeof(t), ",\"range\":[%.17g,%.17g]", rg->low, rg->high); _sb_add(b, t, (size_t) k);
+                }
+                if (isUnit && v.type == &UA_TYPES[UA_TYPES_EUINFORMATION]) {
+                    UA_EUInformation* eu = (UA_EUInformation*) v.data;
+                    _sb_add(b, ",\"unit\":", 8); _sb_str(b, (const char*) eu->displayName.text.data, eu->displayName.text.length);
+                }
+            }
+            UA_Variant_clear(&v);
+        }
+        UA_BrowseResponse_clear(&r);
+    }
+
+    /* Breadth-first from root, Objects and Variables, max_depth levels,
+     * at most max_nodes variables. [{"node","path","name","type","value","unit","range"}] */
+    static char* _opcua_browse_tree(int64_t h, const char* root, int64_t max_depth, int64_t max_nodes) {
+        opcua_handle_t* x = _opcua_get(h);
+        if (!x) return 0;
+        pthread_mutex_lock(&x->mu);
+        if (!_opcua_ensure(x)) { pthread_mutex_unlock(&x->mu); return 0; }
+        size_t cap = 4096, head = 0, tail = 0;
+        opcua_item_t* q = (opcua_item_t*) calloc(cap, sizeof(opcua_item_t));
+        UA_String rs = UA_STRING((char*) (root && root[0] ? root : "i=85"));
+        if (UA_NodeId_parse(&q[0].id, rs) != UA_STATUSCODE_GOOD) q[0].id = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER);
+        q[0].path[0] = 0; q[0].depth = 0; tail = 1;
+        opcua_sb_t b = {0, 0, 0};
+        _sb_add(&b, "[", 1);
+        int vars = 0;
+        while (head < tail && vars < max_nodes) {
+            opcua_item_t it = q[head++];
+            UA_BrowseDescription bd; UA_BrowseDescription_init(&bd);
+            bd.nodeId = it.id; bd.browseDirection = UA_BROWSEDIRECTION_FORWARD;
+            bd.referenceTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_HIERARCHICALREFERENCES);
+            bd.includeSubtypes = true;
+            bd.nodeClassMask = UA_NODECLASS_OBJECT | UA_NODECLASS_VARIABLE;
+            bd.resultMask = UA_BROWSERESULTMASK_ALL;
+            UA_BrowseRequest br; UA_BrowseRequest_init(&br);
+            br.nodesToBrowse = &bd; br.nodesToBrowseSize = 1; br.requestedMaxReferencesPerNode = 0;
+            UA_BrowseResponse r = UA_Client_Service_browse(x->client, br);
+            for (size_t i = 0; i < r.resultsSize; i++) for (size_t j = 0; j < r.results[i].referencesSize && vars < max_nodes; j++) {
+                UA_ReferenceDescription* rd = &r.results[i].references[j];
+                /* Skip the server's own diagnostics : ns=0 objects (Server, Aliases…). */
+                if (rd->nodeId.nodeId.namespaceIndex == 0) continue;
+                char path[512];
+                snprintf(path, sizeof(path), "%s%s%.*s", it.path, it.path[0] ? "." : "",
+                         (int) rd->browseName.name.length, (const char*) rd->browseName.name.data);
+                if (rd->nodeClass == UA_NODECLASS_OBJECT) {
+                    if (it.depth + 1 < max_depth) {
+                        if (tail == cap) { cap *= 2; q = (opcua_item_t*) realloc(q, cap * sizeof(opcua_item_t)); }
+                        UA_NodeId_copy(&rd->nodeId.nodeId, &q[tail].id);
+                        strcpy(q[tail].path, path); q[tail].depth = it.depth + 1; tail++;
+                    }
+                    continue;
+                }
+                /* A variable : its value, data type and properties. */
+                if (vars) _sb_add(&b, ",", 1);
+                vars++;
+                _sb_add(&b, "{\"node\":", 8); _sb_nodeid(&b, &rd->nodeId.nodeId);
+                _sb_add(&b, ",\"path\":", 8); _sb_str(&b, path, strlen(path));
+                _sb_add(&b, ",\"name\":", 8); _sb_str(&b, (const char*) rd->displayName.text.data, rd->displayName.text.length);
+                UA_Variant v; UA_Variant_init(&v);
+                if (UA_Client_readValueAttribute(x->client, rd->nodeId.nodeId, &v) == UA_STATUSCODE_GOOD && v.type) {
+                    _sb_add(&b, ",\"type\":", 8); _sb_str(&b, v.type->typeName, strlen(v.type->typeName));
+                    int ok = 0; double d = _opcua_number(&v, &ok);
+                    if (ok) { char t[48]; int k = snprintf(t, sizeof(t), ",\"value\":%.17g", d); _sb_add(&b, t, (size_t) k); }
+                }
+                UA_Variant_clear(&v);
+                _opcua_props(x->client, &rd->nodeId.nodeId, &b);
+                _sb_add(&b, "}", 1);
+            }
+            UA_BrowseResponse_clear(&r);
+        }
+        _sb_add(&b, "]", 1);
+        for (size_t i = 0; i < tail; i++) UA_NodeId_clear(&q[i].id);
+        free(q);
+        pthread_mutex_unlock(&x->mu);
+        char* out = (char*) GC_MALLOC_ATOMIC(b.len + 1);
+        if (out) memcpy(out, b.buf, b.len + 1);
+        free(b.buf);
+        return out;
+    }
+
+    /* ---------- Server (simulator) ---------- */
+    static UA_Server* _opcua_srv = 0;
+    static volatile UA_Boolean _opcua_srv_running = false;
+    static uint16_t _opcua_srv_port = 0;
+    static void* _opcua_srv_thread(void* arg) {
+        (void) arg;
+        UA_Server_run(_opcua_srv, &_opcua_srv_running);
+        return 0;
+    }
+    static int _opcua_server_start(int64_t port) {
+        if (_opcua_srv) return 0;
+        UA_ServerConfig sc; memset(&sc, 0, sizeof(sc));
+        sc.logging = UA_Log_Stdout_new(UA_LOGLEVEL_ERROR);   /* a test server : errors only */
+        if (UA_ServerConfig_setMinimal(&sc, (UA_UInt16) port, 0) != UA_STATUSCODE_GOOD) return 0;
+        _opcua_srv = UA_Server_newWithConfig(&sc);
+        if (!_opcua_srv) return 0;
+        _opcua_srv_port = (uint16_t) port;
+        _opcua_srv_running = true;
+        pthread_t t;
+        if (pthread_create(&t, 0, _opcua_srv_thread, 0) != 0) return 0;
+        pthread_detach(t);
+        return 1;
+    }
+    /* Folders of a dotted path under Objects, created on demand ; node ids
+     * ns=1;s=<path>. Returns the id of the last folder. */
+    static UA_NodeId _opcua_folder(const char* path) {
+        UA_NodeId parent = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER);
+        char acc[512] = "";
+        const char* p = path;
+        while (p && *p) {
+            const char* e = strchr(p, '.');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            char name[128]; snprintf(name, sizeof(name), "%.*s", (int) len, p);
+            size_t al = strlen(acc);
+            snprintf(acc + al, sizeof(acc) - al, "%s%s", al ? "." : "", name);
+            UA_NodeId id = UA_NODEID_STRING_ALLOC(1, acc);
+            UA_ObjectAttributes oa = UA_ObjectAttributes_default;
+            oa.displayName = UA_LOCALIZEDTEXT("", name);
+            UA_Server_addObjectNode(_opcua_srv, id, parent, UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES),
+                UA_QUALIFIEDNAME(1, name), UA_NODEID_NUMERIC(0, UA_NS0ID_FOLDERTYPE), oa, 0, 0);
+            UA_NodeId_clear(&parent);
+            parent = id;
+            if (!e) break;
+            p = e + 1;
+        }
+        return parent;
+    }
+    /* A variable <folder>.<name> (node id ns=1;s=<folder>.<name>) ;
+     * with lo < hi, unit != "" : the EURange and EngineeringUnits
+     * properties of an analog item. Integer when is_int. */
+    static int _opcua_server_add(const char* folder, const char* name, double value, int is_int, double lo, double hi, const char* unit) {
+        if (!_opcua_srv || !name) return 0;
+        UA_NodeId parent = _opcua_folder(folder);
+        char full[600]; snprintf(full, sizeof(full), "%s%s%s", folder && folder[0] ? folder : "", folder && folder[0] ? "." : "", name);
+        UA_NodeId id = UA_NODEID_STRING_ALLOC(1, full);
+        UA_VariableAttributes va = UA_VariableAttributes_default;
+        UA_Int16 iv = (UA_Int16) value; UA_Double dv = value;
+        if (is_int) UA_Variant_setScalar(&va.value, &iv, &UA_TYPES[UA_TYPES_INT16]);
+        else UA_Variant_setScalar(&va.value, &dv, &UA_TYPES[UA_TYPES_DOUBLE]);
+        va.displayName = UA_LOCALIZEDTEXT("", (char*) name);
+        va.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
+        UA_StatusCode sc = UA_Server_addVariableNode(_opcua_srv, id, parent, UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+            UA_QUALIFIEDNAME(1, (char*) name), UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE), va, 0, 0);
+        if (sc == UA_STATUSCODE_GOOD && lo < hi) {
+            UA_Range rg = {lo, hi};
+            UA_VariableAttributes pa = UA_VariableAttributes_default;
+            UA_Variant_setScalar(&pa.value, &rg, &UA_TYPES[UA_TYPES_RANGE]);
+            pa.displayName = UA_LOCALIZEDTEXT("", "EURange");
+            UA_Server_addVariableNode(_opcua_srv, UA_NODEID_NULL, id, UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                UA_QUALIFIEDNAME(0, "EURange"), UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE), pa, 0, 0);
+        }
+        if (sc == UA_STATUSCODE_GOOD && unit && unit[0]) {
+            UA_EUInformation eu; UA_EUInformation_init(&eu);
+            eu.namespaceUri = UA_STRING("http://www.opcfoundation.org/UA/units/un/cefact");
+            eu.displayName = UA_LOCALIZEDTEXT("", (char*) unit);
+            eu.description = UA_LOCALIZEDTEXT("", (char*) unit);
+            UA_VariableAttributes pa = UA_VariableAttributes_default;
+            UA_Variant_setScalar(&pa.value, &eu, &UA_TYPES[UA_TYPES_EUINFORMATION]);
+            pa.displayName = UA_LOCALIZEDTEXT("", "EngineeringUnits");
+            UA_Server_addVariableNode(_opcua_srv, UA_NODEID_NULL, id, UA_NODEID_NUMERIC(0, UA_NS0ID_HASPROPERTY),
+                UA_QUALIFIEDNAME(0, "EngineeringUnits"), UA_NODEID_NUMERIC(0, UA_NS0ID_PROPERTYTYPE), pa, 0, 0);
+        }
+        UA_NodeId_clear(&id); UA_NodeId_clear(&parent);
+        return sc == UA_STATUSCODE_GOOD;
+    }
+    static int _opcua_server_set(const char* node, double value) {
+        if (!_opcua_srv || !node) return 0;
+        UA_NodeId id; UA_String s = UA_STRING((char*) node);
+        if (UA_NodeId_parse(&id, s) != UA_STATUSCODE_GOOD) return 0;
+        UA_Variant cur; UA_Variant_init(&cur);
+        UA_Server_readValue(_opcua_srv, id, &cur);
+        UA_Variant v; UA_Variant_init(&v);
+        UA_Int16 iv = (UA_Int16) value; UA_Double dv = value;
+        if (cur.type == &UA_TYPES[UA_TYPES_INT16]) UA_Variant_setScalar(&v, &iv, &UA_TYPES[UA_TYPES_INT16]);
+        else UA_Variant_setScalar(&v, &dv, &UA_TYPES[UA_TYPES_DOUBLE]);
+        UA_StatusCode sc = UA_Server_writeValue(_opcua_srv, id, v);
+        UA_Variant_clear(&cur); UA_NodeId_clear(&id);
+        return sc == UA_STATUSCODE_GOOD;
+    }
+}
+
+public class OpcUa {
+    public OpcUa() {}
+
+    // Handle (>= 0) for an opc.tcp:// endpoint ; -1 for a bad URL or when
+    // 32 handles are open. A server that does not answer yet still gets a
+    // handle : each call connects again (IsConnected, LastError).
+    public static int Connect(url: string, timeoutMs: int) {
+        var h: int = -1
+        @c { h = _opcua_connect((const char*) url, (int64_t) timeoutMs); }
+        return h
+    }
+
+    public static void Close(h: int) {
+        @c {
+            opcua_handle_t* x = _opcua_get((int64_t) h);
+            if (x) { UA_Client_disconnect(x->client); UA_Client_delete(x->client); x->used = 0; }
+        }
+    }
+
+    public static bool IsConnected(h: int) {
+        var ok: bool = false
+        @c {
+            opcua_handle_t* x = _opcua_get((int64_t) h);
+            if (x) { UA_SecureChannelState a; UA_SessionState s; UA_StatusCode c; UA_Client_getState(x->client, &a, &s, &c); ok = s == UA_SESSIONSTATE_ACTIVATED; }
+        }
+        return ok
+    }
+
+    public static string LastError(h: int) {
+        var s: string = ""
+        @c { opcua_handle_t* x = _opcua_get((int64_t) h); if (x) s = x->err; }
+        return s
+    }
+
+    // Read the values of comma-separated node ids ("ns=1;s=P1.Debit,i=2258")
+    // in one request. Returns how many are good ; -1 when the server cannot
+    // be reached, -4 for a bad handle. Values : Value(h, i), Status(h, i).
+    public static int ReadMany(h: int, nodeIds: string) {
+        var n: int = -4
+        @c { n = _opcua_read_many((int64_t) h, (const char*) nodeIds); }
+        return n
+    }
+
+    // Value i of the last ReadMany, as a number (booleans 0 / 1).
+    public static float Value(h: int, i: int) {
+        var v: float = 0.0
+        @c { opcua_handle_t* x = _opcua_get((int64_t) h); if (x && i >= 0 && i < x->n) v = x->vals[i]; }
+        return v
+    }
+
+    // OPC UA status code of value i (0 : good ; else e.g. BadNodeIdUnknown).
+    public static int Status(h: int, i: int) {
+        var s: int = -1
+        @c { opcua_handle_t* x = _opcua_get((int64_t) h); if (x && i >= 0 && i < x->n) s = (int64_t) x->status[i]; }
+        return s
+    }
+
+    public static string StatusName(code: int) {
+        var s: string = ""
+        @c { s = (code_string) UA_StatusCode_name((UA_StatusCode) code); }
+        return s
+    }
+
+    // The variables under `root` ("i=85" : Objects), breadth-first, at most
+    // maxDepth folder levels and maxNodes variables, as a JSON array :
+    // [{"node","path","name","type","value","unit","range":[lo,hi]}].
+    // "" when the server cannot be reached.
+    public static string BrowseTree(h: int, root: string, maxDepth: int, maxNodes: int) {
+        var s: string = ""
+        @c { char* r = _opcua_browse_tree((int64_t) h, (const char*) root, (int64_t) maxDepth, (int64_t) maxNodes); if (r) s = r; }
+        return s
+    }
+
+    // ---------- server (tests, demos) ----------
+    // One per process, anonymous, security None, on 0.0.0.0:port.
+    public static bool ServerStart(port: int) {
+        var ok: bool = false
+        @c { ok = _opcua_server_start((int64_t) port) != 0; }
+        return ok
+    }
+
+    // An analog item <folder>.<name> (node id ns=1;s=<folder>.<name>) with
+    // its EURange [lo, hi] and engineering unit.
+    public static bool ServerAddAnalog(folder: string, name: string, value: float, lo: float, hi: float, unit: string) {
+        var ok: bool = false
+        @c { ok = _opcua_server_add((const char*) folder, (const char*) name, value, 0, lo, hi, (const char*) unit) != 0; }
+        return ok
+    }
+
+    // An Int16 variable (a state, a counter).
+    public static bool ServerAddInt(folder: string, name: string, value: int) {
+        var ok: bool = false
+        @c { ok = _opcua_server_add((const char*) folder, (const char*) name, (double) value, 1, 0, 0, "") != 0; }
+        return ok
+    }
+
+    public static bool ServerSet(nodeId: string, value: float) {
+        var ok: bool = false
+        @c { ok = _opcua_server_set((const char*) nodeId, value) != 0; }
+        return ok
+    }
+}

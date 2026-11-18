@@ -1,0 +1,46 @@
+# Package manifest — amalgame-opcua
+#
+# OPC UA for Amalgame over open62541 v1.4.22 (vendored amalgamation,
+# MPL-2.0, see NOTICE.md) : a client (connect, read many nodes in one
+# request, BrowseTree with engineering units and EURange) and a small
+# server for tests and demos.
+#
+# Written for Kairos Edge (SCADA) but has no Kairos dependency.
+
+[package]
+name              = "amalgame-opcua"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "OPC UA client (read, browse with units and ranges) and test server for Amalgame, over open62541."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.52"
+schema-version    = 1
+
+[stdlib]
+class     = "OpcUa"
+header    = "runtime/Amalgame_OpcUa.h"
+namespace = "Amalgame.OpcUa"
+facade    = "facade.am"
+
+# open62541 : pthread, and OpenSSL for its encryption plugin (the same
+# OpenSSL as amalgame-pollen and amalgame-tls). Linux and macOS in v0.1 :
+# Windows needs ws2_32 / iphlpapi, and the manifest has no per-OS libs yet.
+libs      = ["pthread", "ssl", "crypto", "m"]
+
+[stdlib.functions]
+# Client
+Connect      = { returns = "i64" }
+Close        = { returns = "void" }
+IsConnected  = { returns = "code_bool" }
+LastError    = { returns = "code_string" }
+ReadMany     = { returns = "i64" }
+Value        = { returns = "double" }
+Status       = { returns = "i64" }
+StatusName   = { returns = "code_string" }
+BrowseTree   = { returns = "code_string" }
+
+# Server (tests, demos)
+ServerStart     = { returns = "code_bool" }
+ServerAddAnalog = { returns = "code_bool" }
+ServerAddInt    = { returns = "code_bool" }
+ServerSet       = { returns = "code_bool" }

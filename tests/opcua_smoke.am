@@ -1,0 +1,63 @@
+// tests/opcua_smoke.am — amalgame-opcua v0.1.0 end-to-end, one process.
+//
+// The test server plays a small pumping station (analog items with their
+// engineering unit and EURange, an Int16 state). The client
+//   1. finds every variable by BrowseTree, with path, unit, range and value
+//   2. reads three nodes in one request : two good, one unknown
+//   3. sees a value written on the server change
+//   4. gets a handle but no connection for a port where nothing listens,
+//      and -1 for a URL that is not opc.tcp://
+
+namespace OpcUaTests
+
+import Amalgame.OpcUa
+import Amalgame.String
+import Amalgame.Console
+
+public class Program {
+    public static void Check(bool ok, string what) {
+        if (ok) { Console.WriteLine("[PASS] " + what) }
+        else    { Console.WriteLine("[FAIL] " + what) }
+    }
+
+    public static void Sleep(ms: int) {
+        @c { struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L}; nanosleep(&ts, 0); }
+    }
+
+    public static void Main(string[] args) {
+        Program.Check(OpcUa.ServerStart(48400), "server starts on 48400")
+        Program.Check(OpcUa.ServerAddAnalog("Station.Pompage.P1", "Debit", 212.5, 0.0, 400.0, "m³/h"), "analog item with unit and range")
+        OpcUa.ServerAddInt("Station.Pompage.P1", "Etat", 6)
+        OpcUa.ServerAddAnalog("Station.Reseau", "Pression", 4.1, 0.0, 10.0, "bar")
+        Program.Sleep(400)
+
+        let h: int = OpcUa.Connect("opc.tcp://127.0.0.1:48400", 2000)
+        Program.Check(h >= 0 && OpcUa.IsConnected(h), "client connects (" + OpcUa.LastError(h) + ")")
+
+        // 1 — the address space
+        let tree: string = OpcUa.BrowseTree(h, "i=85", 6, 100)
+        Program.Check(String_Contains(tree, "\"path\":\"Station.Pompage.P1.Debit\"") && String_Contains(tree, "\"node\":\"ns=1;s=Station.Pompage.P1.Debit\""), "BrowseTree finds the variable by path and node id")
+        Program.Check(String_Contains(tree, "\"unit\":\"m³/h\"") && String_Contains(tree, "\"range\":[0,400]"), "with its engineering unit and EURange")
+        Program.Check(String_Contains(tree, "\"value\":212.5") && String_Contains(tree, "\"type\":\"Double\""), "with its value and data type")
+        Program.Check(String_Contains(tree, "Station.Pompage.P1.Etat") && String_Contains(tree, "\"type\":\"Int16\"") && String_Contains(tree, "Station.Reseau.Pression"), "every variable, integers too")
+        Program.Check(!String_Contains(tree, "ServerStatus"), "the server's own diagnostics (namespace 0) are left out")
+
+        // 2 — one request, three nodes
+        let n: int = OpcUa.ReadMany(h, "ns=1;s=Station.Pompage.P1.Debit,ns=1;s=Station.Pompage.P1.Etat,ns=1;s=Station.Nope")
+        Program.Check(n == 2, "ReadMany : 2 good out of 3 (got " + String_FromInt(n) + ")")
+        Program.Check(OpcUa.Value(h, 0) == 212.5 && OpcUa.Value(h, 1) == 6.0, "values 212.5 and 6")
+        Program.Check(OpcUa.Status(h, 0) == 0 && OpcUa.StatusName(OpcUa.Status(h, 2)) == "BadNodeIdUnknown", "unknown node : " + OpcUa.StatusName(OpcUa.Status(h, 2)))
+
+        // 3 — a value written on the server
+        Program.Check(OpcUa.ServerSet("ns=1;s=Station.Pompage.P1.Debit", 301.25), "server value written")
+        OpcUa.ReadMany(h, "ns=1;s=Station.Pompage.P1.Debit")
+        Program.Check(OpcUa.Value(h, 0) == 301.25, "the client reads the new value")
+        OpcUa.Close(h)
+
+        // 4 — nothing listening, bad URL
+        let d: int = OpcUa.Connect("opc.tcp://127.0.0.1:48499", 500)
+        Program.Check(d >= 0 && !OpcUa.IsConnected(d) && String_Length(OpcUa.LastError(d)) > 0, "no server : a handle, not connected, and why (" + OpcUa.LastError(d) + ")")
+        Program.Check(OpcUa.ReadMany(d, "ns=1;s=X") == -1, "ReadMany without a server : -1")
+        Program.Check(OpcUa.Connect("http://127.0.0.1:48400", 500) == -1, "a URL that is not opc.tcp:// : -1")
+    }
+}
