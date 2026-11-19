@@ -13,7 +13,7 @@
 # toolchain's gcc and mingw32-make.
 $ErrorActionPreference = 'Stop'
 $pkg   = Split-Path -Parent $PSScriptRoot
-$gcc   = if ($env:AMALGAME_GCC) { $env:AMALGAME_GCC } else { 'C:\Users\bmouget\AppData\Local\Amalgame\gcc' }
+$gcc   = if ($env:AMALGAME_GCC) { $env:AMALGAME_GCC } else { (Join-Path $env:LOCALAPPDATA 'Amalgame\gcc') }
 $cmake = if ($env:CMAKE) { $env:CMAKE } else { 'C:\Tools\cmake-3.31.6-windows-x86_64\bin\cmake.exe' }
 $src   = if ($env:OPEN62541_SRC) { $env:OPEN62541_SRC } else { 'D:\DEV\src-open62541' }
 $env:Path = "$gcc\bin;" + $env:Path
