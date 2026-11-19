@@ -72,12 +72,15 @@ namespace Amalgame.OpcUa
         x->used = 1;
         pthread_mutex_init(&x->mu, 0);
         strcpy(x->url, url);
-        x->client = UA_Client_new();
-        UA_ClientConfig* cc = UA_Client_getConfig(x->client);
-        UA_ClientConfig_setDefault(cc);
-        cc->timeout = (UA_UInt32) (timeout_ms > 0 ? timeout_ms : 2000);
-        /* open62541 logs every step at info level : warnings and errors only. */
-        cc->logging = UA_Log_Stdout_new(UA_LOGLEVEL_WARNING);
+        /* Quiet : the application reports connection losses itself (once, not
+         * every cycle). The logger is set before setDefault, which hands it to
+         * the event loop it creates. */
+        UA_ClientConfig cc; memset(&cc, 0, sizeof(cc));
+        cc.logging = UA_Log_Stdout_new(UA_LOGLEVEL_FATAL);
+        UA_ClientConfig_setDefault(&cc);
+        cc.timeout = (UA_UInt32) (timeout_ms > 0 ? timeout_ms : 2000);
+        x->client = UA_Client_newWithConfig(&cc);
+        if (!x->client) { x->used = 0; pthread_mutex_unlock(&_opcua_mu); return -1; }
         pthread_mutex_unlock(&_opcua_mu);
         /* A server that does not answer yet still gets a handle : every
          * call tries to connect again, as amalgame-modbus does. */

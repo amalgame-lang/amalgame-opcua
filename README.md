@@ -6,7 +6,7 @@ Linux in v0.1 (tested on Ubuntu 24.04). Windows needs `ws2_32` / `iphlpapi`, and
 
 ## Status
 
-**v0.1.0** : client (connect, `ReadMany`, `BrowseTree`, status codes), test server (folders, analog items with `EURange` and `EngineeringUnits`, Int16 variables, writes). Security mode None (anonymous) : the library is built with OpenSSL encryption, and certificates come in v0.2.
+**v0.1.1** : client (connect, `ReadMany`, `BrowseTree`, status codes), test server (folders, analog items with `EURange` and `EngineeringUnits`, Int16 variables, writes). Security mode None (anonymous) : the library is built with OpenSSL encryption, and certificates come in v0.2.
 
 ## Client
 

@@ -9,7 +9,7 @@
 
 [package]
 name              = "amalgame-opcua"
-version           = "0.1.0"
+version           = "0.1.1"
 license           = "Apache-2.0"
 description       = "OPC UA client (read, browse with units and ranges) and test server for Amalgame, over open62541."
 authors           = ["Bastien Mouget"]

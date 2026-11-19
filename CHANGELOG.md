@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.1.1 — 2026-11-19
+
+### Fixed
+
+- The client config (and its logger) is built before the client
+  (`UA_Client_newWithConfig`) : in v0.1.0 the logger was set after the
+  event loop had taken the default one, so open62541 logged every
+  reconnection attempt, and a client whose server went away did not
+  always connect again on the next call. Logging : fatal only (the
+  application reports losses itself, once).
+- `Connect` returns -1 when open62541 cannot create the client.
+
 ## v0.1.0 — 2026-11-18
 
 First version.
